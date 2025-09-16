@@ -21,19 +21,17 @@ python3 -m aiohttp.web -H 0.0.0.0 -P 8000 app:init_func
 """
 
 from asyncio.log import logger
-import os
 import json
-import logging
-from typing import Dict, List, Optional
-from dotenv import load_dotenv
+from typing import Optional
 from aiohttp import web
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.dashboards import GenieAPI
 import asyncio
-import sys
 import traceback
-from datetime import datetime,timezone
-from http import HTTPStatus
+from datetime import datetime, timezone
+import uuid
+from io import BytesIO
+import pandas as pd
 from aiohttp.web import Request, Response, json_response
 from botbuilder.core import (
     BotFrameworkAdapterSettings,
@@ -52,7 +50,6 @@ from botbuilder.schema import (
     ActivityTypes,
     ChannelAccount,
 )
-import requests
 
 from config import DefaultConfig
 
@@ -63,6 +60,9 @@ ADAPTER = CloudAdapter(ConfigurationBotFrameworkAuthentication(CONFIG))
 
 # SETTINGS = BotFrameworkAdapterSettings(CONFIG.APP_ID, CONFIG.APP_PASSWORD,)
 # ADAPTER = BotFrameworkAdapter(SETTINGS)
+
+# Store query results temporarily for download
+query_results_cache: dict[str, dict] = {}
 
 
 async def on_error(context: TurnContext, error: Exception):
@@ -176,15 +176,24 @@ async def ask_genie(
         )
 
 
-def process_query_results(answer_json: Dict) -> str:
+def process_query_results(answer_json: dict, user_id: Optional[str] = None) -> str:
     response = ""
     if "query_description" in answer_json and answer_json["query_description"]:
         response += f"## Query Description\n\n{answer_json['query_description']}\n\n"
 
     if "columns" in answer_json and "data" in answer_json:
+        if user_id:
+            download_id = str(uuid.uuid4())
+            query_results_cache[download_id] = {
+                "columns": answer_json["columns"],
+                "data": answer_json["data"],
+                "query_description": answer_json.get("query_description", ""),
+                "timestamp": datetime.now()
+            }
         response += "## Query Results\n\n"
         columns = answer_json["columns"]
-        data = answer_json["data"]
+        data = answer_json["data"] 
+
         if isinstance(columns, dict) and "columns" in columns:
             header = "| " + " | ".join(col["name"] for col in columns["columns"]) + " |"
             separator = "|" + "|".join(["---" for _ in columns["columns"]]) + "|"
@@ -202,6 +211,10 @@ def process_query_results(answer_json: Dict) -> str:
                         formatted_value = str(value)
                     formatted_row.append(formatted_value)
                 response += "| " + " | ".join(formatted_row) + " |\n"
+
+            # Add download link if we have cached the data
+            if download_id:
+                response += f"\n\n📊 **[Download as Excel](http://localhost:{CONFIG.PORT}/download/{download_id})**"
         else:
             response += f"Unexpected column format: {columns}\n\n"
     elif "message" in answer_json:
@@ -211,10 +224,60 @@ def process_query_results(answer_json: Dict) -> str:
 
     return response
 
+async def download_excel(request: Request) -> Response:
+    download_id = request.match_info.get('download_id')
+    
+    if download_id not in query_results_cache:
+        return Response(status=404, text="Download not found or expired")
+        
+    try:
+        cached_data = query_results_cache[download_id]
+        columns = cached_data["columns"]
+        data = cached_data["data"]
+        query_description = cached_data["query_description"]
+        
+        # Create DataFrame
+        if isinstance(columns, dict) and "columns" in columns:
+            column_names = [col["name"] for col in columns["columns"]]
+            df = pd.DataFrame(data["data_array"], columns=column_names)
+            
+            # Create Excel file in memory
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df.to_excel(writer, sheet_name='Query Results', index=False)
+                
+                # Add query description as a separate sheet if available
+                if query_description:
+                    desc_df = pd.DataFrame([{'Query Description': query_description}])
+                    desc_df.to_excel(writer, sheet_name='Description', index=False)
+            
+            output.seek(0)
+            
+            # Generate filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"databricks_query_results_{timestamp}.xlsx"
+            
+            # Clean up cache entry
+            del query_results_cache[download_id]
+            
+            return Response(
+                body=output.read(),
+                headers={
+                    'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    'Content-Disposition': f'attachment; filename="{filename}"'
+                }
+            )
+        else:
+            return Response(status=400, text="Invalid data format")
+            
+    except Exception as e:
+        logger.error(f"Error generating Excel file: {str(e)}")
+        return Response(status=500, text="Error generating Excel file")
+
 
 class MyBot(ActivityHandler):
     def __init__(self):
-        self.conversation_ids: Dict[str, str] = {}
+        self.conversation_ids: dict[str, str] = {}
 
     async def on_message_activity(self, turn_context: TurnContext):
         ##print("Message activity",turn_context.activity.text)
@@ -243,7 +306,7 @@ class MyBot(ActivityHandler):
             )
 
     async def on_members_added_activity(
-        self, members_added: List[ChannelAccount], turn_context: TurnContext
+        self, members_added: list[ChannelAccount], turn_context: TurnContext
     ):
         ##print("Members added",members_added)
         for member in members_added:
@@ -272,11 +335,22 @@ async def messages(req: Request) -> Response:
     except Exception as e:
         logger.error(f"Error processing request: {str(e)}")
         return Response(status=500)
+    
+
+async def health(request):
+    return web.Response(text="ok")  # 200
+
+async def robots(request):
+    # Azure probes /robots933456.txt during warmup
+    return web.Response(text="User-agent: *\nDisallow:", content_type="text/plain")
 
 
 def init_func(argv):
     APP = web.Application(middlewares=[aiohttp_error_middleware])
+    APP.router.add_get("/", health)
+    APP.router.add_get("/robots933456.txt", robots)
     APP.router.add_post("/api/messages", messages)
+    APP.router.add_get("/download/{download_id}", download_excel)
     return APP
 
 
