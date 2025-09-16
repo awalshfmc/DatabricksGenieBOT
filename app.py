@@ -178,10 +178,15 @@ async def ask_genie(
 
 def process_query_results(answer_json: dict, user_id: Optional[str] = None) -> str:
     response = ""
+    download_id = None  # ensure defined for all code paths
+
+    # Optional description (from Genie attachment)
     if "query_description" in answer_json and answer_json["query_description"]:
         response += f"## Query Description\n\n{answer_json['query_description']}\n\n"
 
+    # Tabular result (inline JSON)
     if "columns" in answer_json and "data" in answer_json:
+        # If we have a user context, cache for download
         if user_id:
             download_id = str(uuid.uuid4())
             query_results_cache[download_id] = {
@@ -190,35 +195,49 @@ def process_query_results(answer_json: dict, user_id: Optional[str] = None) -> s
                 "query_description": answer_json.get("query_description", ""),
                 "timestamp": datetime.now()
             }
+
         response += "## Query Results\n\n"
         columns = answer_json["columns"]
-        data = answer_json["data"] 
+        data = answer_json["data"]
 
-        if isinstance(columns, dict) and "columns" in columns:
-            header = "| " + " | ".join(col["name"] for col in columns["columns"]) + " |"
-            separator = "|" + "|".join(["---" for _ in columns["columns"]]) + "|"
+        # Expect Genie schema like {"columns": [{"name": "...", "type_name": "..."}]}
+        if isinstance(columns, dict) and "columns" in columns and "data_array" in data:
+            col_defs = columns["columns"]
+            header = "| " + " | ".join(col["name"] for col in col_defs) + " |"
+            separator = "|" + "|".join(["---" for _ in col_defs]) + "|"
             response += header + "\n" + separator + "\n"
+
             for row in data["data_array"]:
                 formatted_row = []
-                for value, col in zip(row, columns["columns"]):
+                for value, col in zip(row, col_defs):
                     if value is None:
                         formatted_value = "NULL"
-                    elif col["type_name"] in ["DECIMAL", "DOUBLE", "FLOAT"]:
-                        formatted_value = f"{float(value):,.2f}"
-                    elif col["type_name"] in ["INT", "BIGINT", "LONG"]:
-                        formatted_value = f"{int(value):,}"
+                    elif col.get("type_name") in {"DECIMAL", "DOUBLE", "FLOAT"}:
+                        try:
+                            formatted_value = f"{float(value):,.2f}"
+                        except Exception:
+                            formatted_value = str(value)
+                    elif col.get("type_name") in {"INT", "BIGINT", "LONG"}:
+                        try:
+                            formatted_value = f"{int(value):,}"
+                        except Exception:
+                            formatted_value = str(value)
                     else:
                         formatted_value = str(value)
                     formatted_row.append(formatted_value)
                 response += "| " + " | ".join(formatted_row) + " |\n"
 
-            # Add download link if we have cached the data
+            # Only add a download link if we actually cached something
             if download_id:
-                response += f"\n\n📊 **[Download as Excel](http://localhost:{CONFIG.PORT}/download/{download_id})**"
+                # relative path so it works behind Azure App Service hostnames
+                response += f"\n\n📊 **[Download as Excel](/download/{download_id})**\n"
         else:
             response += f"Unexpected column format: {columns}\n\n"
+
+    # Plain-text answer
     elif "message" in answer_json:
         response += f"{answer_json['message']}\n\n"
+
     else:
         response += "No data available.\n\n"
 
@@ -292,7 +311,7 @@ class MyBot(ActivityHandler):
             self.conversation_ids[user_id] = new_conversation_id
 
             answer_json = json.loads(answer)
-            response = process_query_results(answer_json)
+            response = process_query_results(answer_json, user_id)
 
             await turn_context.send_activity(response)
         except json.JSONDecodeError:
