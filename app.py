@@ -21,6 +21,7 @@ python3 -m aiohttp.web -H 0.0.0.0 -P 8000 app:init_func
 """
 
 from asyncio.log import logger
+import logging
 import json
 from typing import Optional
 from aiohttp import web
@@ -32,16 +33,12 @@ from datetime import datetime, timezone
 import uuid
 from io import BytesIO
 import pandas as pd
-import requests
+import time
 from aiohttp.web import Request, Response, json_response
 from botbuilder.core import (
-    BotFrameworkAdapterSettings,
-    BotFrameworkAdapter,
-    ActivityHandler,
     TurnContext,
 )
 from botbuilder.core.teams import TeamsActivityHandler
-from botbuilder.schema.teams import FileConsentCard, FileInfoCard
 from botbuilder.core.integration import aiohttp_error_middleware
 from botbuilder.integration.aiohttp import (
     CloudAdapter,
@@ -49,8 +46,6 @@ from botbuilder.integration.aiohttp import (
 )
 from botbuilder.schema import (
     Activity,
-    Attachment,
-    ConversationReference,
     ActivityTypes,
     ChannelAccount,
 )
@@ -65,8 +60,29 @@ ADAPTER = CloudAdapter(ConfigurationBotFrameworkAuthentication(CONFIG))
 # SETTINGS = BotFrameworkAdapterSettings(CONFIG.APP_ID, CONFIG.APP_PASSWORD,)
 # ADAPTER = BotFrameworkAdapter(SETTINGS)
 
+# Set up logger
+logger = logging.getLogger(__name__)
+
 # Store query results temporarily for download
 query_results_cache: dict[str, dict] = {}
+CACHE_EXPIRY_SECONDS = 300  # Cache expiry time in seconds (e.g., 5 minutes)
+
+workspace_client = WorkspaceClient(host=CONFIG.DATABRICKS_HOST, token=CONFIG.DATABRICKS_TOKEN)
+
+genie_api = GenieAPI(workspace_client.api_client)
+
+
+def cleanup_expired_cache_entries():
+    """Remove cache entries older than CACHE_EXPIRY_SECONDS"""
+    current_time = time.time()
+    expired_keys = [
+        key
+        for key, value in query_results_cache.items()
+        if current_time - value.get("timestamp", 0) > CACHE_EXPIRY_SECONDS
+    ]
+    for key in expired_keys:
+        del query_results_cache[key]
+    logger.debug(f"Cleaned up {len(expired_keys)} expired cache entries")
 
 
 async def on_error(context: TurnContext, error: Exception):
@@ -95,10 +111,6 @@ async def on_error(context: TurnContext, error: Exception):
 
 
 ADAPTER.on_turn_error = on_error
-
-workspace_client = WorkspaceClient(host=CONFIG.DATABRICKS_HOST, token=CONFIG.DATABRICKS_TOKEN)
-
-genie_api = GenieAPI(workspace_client.api_client)
 
 
 async def ask_genie(
@@ -224,11 +236,15 @@ def process_query_results(answer_json: dict, user_id: Optional[str] = None) -> s
                     if value is None:
                         cells.append("NULL")
                     elif t in {"DECIMAL", "DOUBLE", "FLOAT"}:
-                        try: cells.append(f"{float(value):,.2f}")
-                        except: cells.append(str(value))
+                        try:
+                            cells.append(f"{float(value):,.2f}")
+                        except:
+                            cells.append(str(value))
                     elif t in {"INT", "BIGINT", "LONG"}:
-                        try: cells.append(f"{int(value):,}")
-                        except: cells.append(str(value))
+                        try:
+                            cells.append(f"{int(value):,}")
+                        except:
+                            cells.append(str(value))
                     else:
                         cells.append(str(value))
                 response += "| " + " | ".join(cells) + " |\n"
@@ -245,58 +261,109 @@ def process_query_results(answer_json: dict, user_id: Optional[str] = None) -> s
 async def download_excel(request: Request) -> Response:
     download_id = request.match_info.get("download_id")
 
+    logger.debug(f"Requested download_id: {download_id}")
+    logger.debug(f"Available cache keys: {list(query_results_cache.keys())}")
+    logger.debug(f"Cache size: {len(query_results_cache)}")
+
     if download_id not in query_results_cache:
         return Response(status=404, text="Download not found or expired")
 
     try:
         cached_data = query_results_cache[download_id]
-        columns = cached_data["columns"]
-        data = cached_data["data"]
-        query_description = cached_data["query_description"]
 
-        # Create DataFrame
-        if isinstance(columns, dict) and "columns" in columns:
-            column_names = [col["name"] for col in columns["columns"]]
-            df = pd.DataFrame(data["data_array"], columns=column_names)
-
-            # Create Excel file in memory
-            output = BytesIO()
-            with pd.ExcelWriter(output, engine="openpyxl") as writer:
-                df.to_excel(writer, sheet_name="Query Results", index=False)
-
-                # Add query description as a separate sheet if available
-                if query_description:
-                    desc_df = pd.DataFrame([{"Query Description": query_description}])
-                    desc_df.to_excel(writer, sheet_name="Description", index=False)
-
-            output.seek(0)
-
-            # Generate filename
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"databricks_query_results_{timestamp}.xlsx"
-
-            # Clean up cache entry
-            del query_results_cache[download_id]
-
-            return Response(
-                body=output.read(),
-                headers={
-                    "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    "Content-Disposition": f'attachment; filename="{filename}"',
-                },
-            )
+        # Check if we have pre-built Excel bytes
+        if "excel_bytes" in cached_data:
+            excel_bytes = cached_data["excel_bytes"]
         else:
-            return Response(status=400, text="Invalid data format")
+            # Build Excel bytes on demand (fallback)
+            columns = cached_data["columns"]
+            data = cached_data["data"]
+            query_description = cached_data["query_description"]
+
+            if isinstance(columns, dict) and "columns" in columns:
+                column_names = [col["name"] for col in columns["columns"]]
+                df = pd.DataFrame(data["data_array"], columns=column_names)
+
+                output = BytesIO()
+                with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                    df.to_excel(writer, sheet_name="Query Results", index=False)
+                    if query_description:
+                        desc_df = pd.DataFrame([{"Query Description": query_description}])
+                        desc_df.to_excel(writer, sheet_name="Description", index=False)
+
+                output.seek(0)
+                excel_bytes = output.read()
+            else:
+                return Response(status=400, text="Invalid data format")
+
+        # Generate filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"databricks_query_results_{timestamp}.xlsx"
+
+        # Force download with proper headers
+        response = Response(
+            body=excel_bytes,
+            headers={
+                "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Length": str(len(excel_bytes)),
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+                "X-Content-Type-Options": "nosniff",
+                "X-Frame-Options": "DENY",
+                "Content-Security-Policy": "default-src 'none'",
+            },
+        )
+
+        return response
 
     except Exception as e:
         logger.error(f"Error generating Excel file: {str(e)}")
+        traceback.print_exc()
         return Response(status=500, text="Error generating Excel file")
+
+
+async def test_download_endpoint(request: Request) -> Response:
+    """Test endpoint to verify download functionality"""
+    # Create test data
+    test_id = "test-download-123"
+    query_results_cache[test_id] = {
+        "columns": {
+            "columns": [
+                {"name": "Product", "type_name": "STRING"},
+                {"name": "Sales", "type_name": "INT"},
+                {"name": "Revenue", "type_name": "DECIMAL"},
+            ]
+        },
+        "data": {
+            "data_array": [
+                ["Product A", 100, 1500.50],
+                ["Product B", 200, 3200.75],
+                ["Product C", 150, 2100.25],
+            ]
+        },
+        "query_description": "Test query for download functionality",
+    }
+
+    download_url = f"{CONFIG.APP_BASE_URL}/download/{test_id}"
+
+    return web.Response(
+        text=f"""
+        Test download created!
+        
+        Download URL: {download_url}
+        Cache keys: {list(query_results_cache.keys())}
+        
+        Click the link above to test download.
+        """,
+        content_type="text/plain",
+    )
 
 
 class MyBot(TeamsActivityHandler):
     def __init__(self):
         self.conversation_ids: dict[str, str] = {}
-        self._excel_cache: dict[str, bytes] = {}
 
     async def on_message_activity(self, turn_context: TurnContext):
         question = turn_context.activity.text
@@ -314,75 +381,57 @@ class MyBot(TeamsActivityHandler):
             text = process_query_results(answer_json, user_id=user_id)
             await turn_context.send_activity(text)
 
-            # 4b) if we have tabular data, also offer the Excel as a Teams file card
+            # 4b) if we have tabular data, create download functionality
             xbytes = build_excel_bytes_from_answer(answer_json)
             if xbytes:
-                # cache the latest excel for this user (retrieved in on_invoke)
-                self._excel_cache[user_id] = xbytes
-                fname = f"databricks_query_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-                consent = FileConsentCard(
-                    description="Databricks Genie query results",
-                    size_in_bytes=len(xbytes),
-                    name=fname,
-                )
-                attachment = Attachment(
-                    content_type="application/vnd.microsoft.teams.card.file.consent",
-                    content=consent,
-                    name=fname,
-                )
-                await turn_context.send_activity(Activity(attachments=[attachment]))
+                # Store the Excel data in cache for download
+                download_id = str(uuid.uuid4())
+                query_results_cache[download_id] = {
+                    "columns": answer_json.get("columns", {}),
+                    "data": answer_json.get("data", {}),
+                    "query_description": answer_json.get("query_description", ""),
+                    "excel_bytes": xbytes,  # Store the actual Excel bytes
+                    "timestamp": time.time(),  # Store the time of caching
+                }
+
+                cleanup_expired_cache_entries()  # Clean up old cache entries
+
+                fname = f"genie_query_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                download_url = f"{CONFIG.APP_BASE_URL}/download/{download_id}"
+
+                # Add debug logging
+                logger.debug(f"Generated download URL: {download_url}")
+                logger.debug(f"Download ID: {download_id}")
+                logger.debug(f"Cache contains: {list(query_results_cache.keys())}")
+                logger.debug(f"Stored excel_bytes size: {len(xbytes)} bytes")
+
+                # Create a simple text message with download link
+                download_message = f"""📊 **Query Results Ready for Download**
+
+Your data has been prepared as an Excel file: `{fname}`
+
+[📥 Download Excel File]({download_url})
+
+*Note: The download link will expire after use for security.*"""
+
+                await turn_context.send_activity(download_message)
 
         except json.JSONDecodeError:
             await turn_context.send_activity("Failed to decode response from the server.")
         except Exception as e:
             logger.error(f"Error processing message: {str(e)}")
-            await turn_context.send_activity("An error occurred while processing your request.")
+            await turn_context.send_activity(
+                f"An error occurred while processing your request. Error message: {str(e)}"
+            )
 
     async def on_members_added_activity(
         self, members_added: list[ChannelAccount], turn_context: TurnContext
     ):
-        ##print("Members added",members_added)
         for member in members_added:
             if member.id != turn_context.activity.recipient.id:
-                await turn_context.send_activity("Welcome to the Databricks Genie Bot!")
+                await turn_context.send_activity("Welcome to the Trade Data Genie Bot!")
 
     async def on_invoke_activity(self, turn_context: TurnContext):
-        # Teams file-consent callbacks
-        if turn_context.activity.name == "fileConsent/invoke":
-            v = turn_context.activity.value or {}
-            action = v.get("action")
-            if action == "accept":
-                info = v.get("uploadInfo", {}) or {}
-                upload_url = info.get("uploadUrl")
-                file_name = info.get("name")
-                user_id = turn_context.activity.from_property.id
-
-                xbytes = self._excel_cache.get(user_id)
-                if not (upload_url and xbytes):
-                    await turn_context.send_activity("Sorry, I couldn’t find the file to upload.")
-                    return web.Response(status=200)
-
-                # Upload to the pre-signed URL
-                headers = {
-                    "Content-Range": f"bytes 0-{len(xbytes)-1}/{len(xbytes)}",
-                    "Content-Type": "application/octet-stream",
-                }
-                r = requests.put(upload_url, data=xbytes, headers=headers, timeout=60)
-                r.raise_for_status()
-
-                # Tell Teams we're done: send a File Info card (renders the preview tile)
-                finfo = FileInfoCard(unique_id=info.get("uniqueId"), file_type="xlsx")
-                attach = Attachment(
-                    content_type="application/vnd.microsoft.teams.card.file.info",
-                    name=file_name,
-                    content=finfo,
-                )
-                await turn_context.send_activity(Activity(attachments=[attach]))
-                return web.Response(status=200)
-
-            elif action == "decline":
-                await turn_context.send_activity("Okay—won’t upload the file.")
-                return web.Response(status=200)
 
         # default handling
         return await super().on_invoke_activity(turn_context)
@@ -426,6 +475,7 @@ def init_func(argv):
     APP.router.add_get("/robots933456.txt", robots)
     APP.router.add_post("/api/messages", messages)
     APP.router.add_get("/download/{download_id}", download_excel)
+    APP.router.add_get("/test-download", test_download_endpoint)
     return APP
 
 
