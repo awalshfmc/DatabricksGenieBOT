@@ -371,6 +371,12 @@ class MyBot(TeamsActivityHandler):
         conversation_id = self.conversation_ids.get(user_id)
 
         try:
+            typing_activity = Activity(
+                type=ActivityTypes.typing,
+                timestamp=datetime.now(timezone.utc)
+            )
+            await turn_context.send_activity(typing_activity)
+            
             answer, new_conversation_id = await ask_genie(
                 question, CONFIG.DATABRICKS_SPACE_ID, conversation_id
             )
